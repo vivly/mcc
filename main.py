@@ -23,28 +23,23 @@ class Config(BaseConfig):
 
         self.start_date = '2020-03-01'
         self.min_peak_size = -1
-        self.forecast_date = '2020-06-29'
+        self.forecast_date = '2021-02-14'
         self.lookback_days = 14
         self.horizon = 3
         self.val_days = 1
         self.sample_ratio = 0.8
         self.lookahead_days = 1
 
-        # For GCN
-        self.gcn_dim = 64
-        self.gcn_type = 'gcn'
-        self.gcn_aggr = 'max'
-        self.gcn_layer_num = 2
-        self.gcn_node_dim = 4
-        self.gcn_edge_dim = 4
+        # For MPNNLSTM
+        self.mpnnlstm_in_channels = 1
+        self.mpnnlstm_hidden_size = 16
+        self.mpnnlstm_num_nodes = 1000
+        self.mpnnlstm_window = 14
+        self.mpnnlstm_dropout = .01
 
-        # For RNN
-        self.rnn_dim = 16
-        self.rnn_layer_num = 3
-        self.date_emb_dim = 2
-        self.block_size = 3
-        self.hidden_dim = 32
-        self.id_emb_dim = 8
+        # For LSTM Abl
+        self.abl_lstm_dim = 16
+        self.abl_lstm_layer_num = 3
 
         # For Abl
         self.abl_type = 'mpnn_lstm'
@@ -136,6 +131,7 @@ class Task:
         node_type_count = scatter(base_ones, self.node_type, dim_size=self.config.num_node_types, reduce='sum')
         self.node_weight = 1.0 / node_type_count * node_type_count.max()
 
+
     def train_LSTM(self):
         # This method is used for LSTM comparison
         train_data_ratio = 0.8  # Choose 80% of the data for training
@@ -152,8 +148,8 @@ class Task:
         train_x_tensor = torch.from_numpy(train_x_tensor)
         train_y_tensor = torch.from_numpy(train_y_tensor)
 
-        lstm_model = LSTM(input_size=1, hidden_size=self.config.rnn_dim,
-                          output_size=1, num_layers=self.config.rnn_layer_num)
+        lstm_model = LSTM(input_size=1, hidden_size=self.config.abl_lstm_dim,
+                          output_size=1, num_layers=self.config.abl_lstm_layer_num)
         lstm_model = lstm_model.to(device=self.config.cuda_device)
         criterion = torch.nn.L1Loss()
         optimizer = torch.optim.Adam(lstm_model.parameters(), lr=1e-2)
@@ -203,9 +199,11 @@ class Task:
         loss = criterion(torch.from_numpy(pred_y_for_test), torch.from_numpy(test_y))
         print("test loss：", loss.item())
 
+        exit(10)
+
 
 class Wrapper(torch.nn.Module):
-    def __init__(self, conf, edge_weight):
+    def __init__(self, conf):
         super().__init__()
         self.config = conf
 
@@ -214,10 +212,17 @@ class Wrapper(torch.nn.Module):
         elif conf.abl_type == 'mpnn_lstm':
             self.net = model.MPNNLSTM(conf)
         else:
-            raise ValueError('Not Expected Model Type')
+            raise ValueError('Unexpected Model Type')
 
     def forward(self, input_days, g):
-        return self.net(input_days, g)
+        if self.config.abl_type == 'mpnn_lstm':
+            _x = input_days
+            edge_idx = g['edge_idx']
+            edge_wgt = g['edge_weight']
+            out = self.net(_x, edge_idx, edge_wgt)
+            return out
+        else:
+            raise ValueError('Unexpected Model Type')
 
     def get_net_parameters(self):
         return self.net.parameters()
@@ -233,5 +238,12 @@ if __name__ == '__main__':
     node, graph = load_data.load_data()
     task = Task(config)
     task.set_random_seed()
-    net = Wrapper(task.config, task.edge_weight)
+    # Set random seed before the initialization of network parameters
+    net = Wrapper(task.config)
+    task.init_model_and_optimizer(net)
+    print('Building Neural Network...')
+    # Select epoch with the best validation accuracy
+    best_epoch = 50
+    if not task.config.infer:
+        task.fit()
 

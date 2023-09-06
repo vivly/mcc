@@ -1,8 +1,6 @@
 import torch
 import torch_geometric.nn as PyG
-
 from torch import nn
-from nbeats import NBeatsEncoder
 import torch_geometric_temporal as tgt
 
 
@@ -28,13 +26,20 @@ class LSTM(nn.Module):
         return x
 
 
-class MPNNLSTM(tgt.nn.MPNNLSTM):
+class MPNNLSTM(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.mpnn = tgt.nn.MPNNLSTM(in_channels=1, hidden_size=1, num_nodes=1, window=1, dropout=0.1)
+        self.in_channels = config.in_fea_dim
+        self.hidden_size = config.mpnnlstm_hidden_size
+        self.num_nodes = config.num_nodes
+        self.window = config.day_seq_len
+        self.dropout = config.mpnnlstm_dropout
+        self.mpnnlstm = tgt.nn.MPNNLSTM(in_channels=self.in_channels, hidden_size=self.hidden_size,
+                                         num_nodes=self.num_nodes, window=self.window, dropout=self.dropout)
 
-    def forward(self):
-        pass
+    def forward(self, _x, edge_idx, edge_wgt):
+        H = self.mpnnlstm(X=_x, edge_index=edge_idx, edge_weight=edge_wgt)
+        return H
 
 
 
