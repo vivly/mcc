@@ -61,7 +61,7 @@ def load_GDP_dataset():
     return gdp_df
 
 
-def load_OxCGRT_policy_data(jhu_csse_data):
+def load_OxCGRT_policy_data(jhu_csse_data, fp):
     print('loading OxCGRT policy dataset...')
     OxCGRT_df = pd.read_csv(oxcgrt_path, low_memory=False)
     OxCGRT_df = OxCGRT_df[OxCGRT_df['Jurisdiction'] == 'STATE_TOTAL']
@@ -99,6 +99,7 @@ def load_OxCGRT_policy_data(jhu_csse_data):
     tmp_df2 = pd.concat(tmp_list1, axis=0, ignore_index=False)
     print('OxCGRT policy dataset load complete!')
     # Two layers of recurrences: first iterate the location, i.e. the states; second recurrence iterate the date
+    tmp_df2.to_csv(fp)
     return tmp_df2
 
 
@@ -107,8 +108,9 @@ def clean(jhu_dataset, gdp_dataset, policy_dataset):
     confirm = jhu_dataset[jhu_csse_key[2]]
     death = jhu_dataset[jhu_csse_key[3]]
     population = jhu_dataset[jhu_csse_key[4]]
-
+    population = population[~population.index.duplicated()]
     # align all the dataframes to make sure the number of counties is equal.
+
     gdp, policy = gdp_dataset.align(policy_dataset, join='inner', axis=0)
     gdp, geo = gdp.align(geo, join='inner', axis=0)
     _, population = gdp.align(population, join='inner', axis=0)
@@ -216,20 +218,30 @@ def generate_us_graph(topo, node_rep, dump_fp, max_neighbor_num=50, dump_flag=Tr
 
 def load_data():
     fp_graph = './data/us_graph.cpt'
+    fp_oxcgrt = './data/oxcgrt_data.csv'
     pandarallel.initialize(progress_bar=False)
     # load data from JHU CSSE dataset
     JHU_CSSE_data = load_JHU_CSSE_dataset()
     # load data from CAGDP1 GDP dataset
     gdp_data = load_GDP_dataset()
     # load data from policy dataset
-    OxCGRT_data = load_OxCGRT_policy_data(JHU_CSSE_data)
+    if os.path.exists(fp_oxcgrt):
+        OxCGRT_data = pd.read_csv(fp_oxcgrt, index_col='FIPS')
+        print('Reading Existing OxCGRT Data')
+    else:
+        OxCGRT_data = load_OxCGRT_policy_data(JHU_CSSE_data, fp_oxcgrt)
     # clean and align different datasets
+
     node_rep_dict = clean(JHU_CSSE_data, gdp_data, OxCGRT_data)
 
-    # calculate the geology topo.
-    geo_county = calculate_geo_topology(node_rep=node_rep_dict, max_state_neighbour=5)
-    # generate the graph for all counties
-    graph_info = generate_us_graph(topo=geo_county, node_rep=node_rep_dict, dump_fp=fp_graph)
+    if os.path.exists(fp_graph):
+        graph_info = torch.load(fp_graph)
+        print('Reading Existing Graph Data')
+    else:
+        # calculate the geology topo.
+        geo_county = calculate_geo_topology(node_rep=node_rep_dict, max_state_neighbour=5)
+        # generate the graph for all counties
+        graph_info = generate_us_graph(topo=geo_county, node_rep=node_rep_dict, dump_fp=fp_graph)
 
     return node_rep_dict, graph_info
 

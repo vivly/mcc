@@ -11,7 +11,6 @@ from model import LSTM
 from torch_scatter import scatter
 
 
-
 class Config(BaseConfig):
     def __init__(self):
         super().__init__()
@@ -20,7 +19,7 @@ class Config(BaseConfig):
         self.early_stop_epochs = 15
         self.infer = False
         self.cuda_device = torch.device('cuda:0')
-        self.batch_size = 2
+        self.batch_size = 3
 
         self.start_date = '2020-03-01'
         self.min_peak_size = -1
@@ -40,13 +39,15 @@ class Config(BaseConfig):
         self.gcn_edge_dim = 4
 
         # For RNN
-        self.rnn_type = 'nbeats'
         self.rnn_dim = 16
         self.rnn_layer_num = 3
         self.date_emb_dim = 2
         self.block_size = 3
         self.hidden_dim = 32
         self.id_emb_dim = 8
+
+        # For Abl
+        self.abl_type = 'mpnn_lstm'
 
 
 class Task:
@@ -74,7 +75,7 @@ class Task:
         # Make Node Representation
         node_ary_list = [self.policy_ary, self.confirm_ary, self.death_ary]
         self.day_inputs = np.stack(node_ary_list, axis=2)
-        self.day_outputs = np.expand_dims(self.policy_ary, axis=-1)
+        self.day_outputs = np.expand_dims(self.confirm_ary, axis=-1)
 
         print('The input vector shape is ' + str(self.day_inputs.shape))
         self.config.num_nodes = self.day_inputs.shape[0]
@@ -112,15 +113,15 @@ class Task:
 
         if self.config.infer:
             self.val_day_inputs = self.day_inputs[:train_div+1]
-            self.val_outputs = self.day_outputs[:train_div+1]
+            self.val_day_outputs = self.day_outputs[:train_div+1]
             self.val_dates = self.dates[:train_div+1]
         else:
             self.val_day_inputs = self.day_inputs[val_div: val_div+1]
-            self.val_outputs = self.day_outputs[val_div: val_div+1]
+            self.val_day_outputs = self.day_outputs[val_div: val_div+1]
             self.val_dates = self.dates[val_div: val_div+1]
 
         self.test_day_inputs = self.day_inputs[test_div: test_div+1]
-        self.test_outputs = self.day_outputs[test_div: test_div+1]
+        self.test_day_outputs = self.day_outputs[test_div: test_div + 1]
         self.test_dates = self.dates[test_div: test_div+1]
 
     def init_graph(self):
@@ -139,20 +140,20 @@ class Task:
         # This method is used for LSTM comparison
         train_data_ratio = 0.8  # Choose 80% of the data for training
         train_data_len = int(self.config.day_seq_len * train_data_ratio)
-        train_x = self.day_inputs[:, 0:train_data_len, :]
-        train_y = self.day_outputs[:, 0:train_data_len, :]
+        train_x = self.train_day_inputs[:, :, 1]
+        train_y = self.train_day_outputs
 
-        test_x = self.day_inputs[:, train_data_len, :]
-        test_y = self.day_inputs[:, train_data_len, :]
+        test_x = self.test_day_inputs[:, :, 1]
+        test_y = self.test_day_outputs
 
-        train_x_tensor = train_x.reshape(-1, self.config.batch_size, self.config.in_fea_dim)
+        train_x_tensor = train_x.reshape(-1, self.config.batch_size, 1)
         train_y_tensor = train_y.reshape(-1, self.config.batch_size, self.config.out_fea_dim)
 
         train_x_tensor = torch.from_numpy(train_x_tensor)
         train_y_tensor = torch.from_numpy(train_y_tensor)
 
-        lstm_model = LSTM(input_size=self.config.in_fea_dim, hidden_size=self.config.rnn_dim,
-                          output_size=self.config.out_fea_dim, num_layers=self.config.rnn_layer_num)
+        lstm_model = LSTM(input_size=1, hidden_size=self.config.rnn_dim,
+                          output_size=1, num_layers=self.config.rnn_layer_num)
         lstm_model = lstm_model.to(device=self.config.cuda_device)
         criterion = torch.nn.L1Loss()
         optimizer = torch.optim.Adam(lstm_model.parameters(), lr=1e-2)
@@ -190,23 +191,30 @@ class Task:
         lstm_model = lstm_model.eval()  # switch to testing model
 
         # prediction on test dataset
-        test_x_tensor = test_x.reshape(-1, self.config.batch_size, self.config.in_fea_dim)
+        test_x_tensor = test_x.reshape(-1, self.config.batch_size, 1)
         test_x_tensor = torch.from_numpy(test_x_tensor)
         test_x_tensor = test_x_tensor.to(self.config.cuda_device)
 
         pred_y_for_test = lstm_model(test_x_tensor).to(self.config.cuda_device)
-        pred_y_for_test = pred_y_for_test.view(-1, self.config.in_fea_dim).data.cpu().numpy()
+        pred_y_for_test = pred_y_for_test.view(-1, 1).data.cpu().numpy()
 
+        pred_y_for_test = pred_y_for_test.squeeze()
+        test_y = test_y.squeeze()
         loss = criterion(torch.from_numpy(pred_y_for_test), torch.from_numpy(test_y))
         print("test loss：", loss.item())
 
 
-class GraphNet(torch.nn.Module):
-    def __init__(self, config, edge_weight):
+class Wrapper(torch.nn.Module):
+    def __init__(self, conf, edge_weight):
         super().__init__()
+        self.config = conf
 
-        self.config = config
-        self.net = model.GNNModel(config)
+        if conf.abl_type == 'lstm':
+            task.train_LSTM()
+        elif conf.abl_type == 'mpnn_lstm':
+            self.net = model.MPNNLSTM(conf)
+        else:
+            raise ValueError('Not Expected Model Type')
 
     def forward(self, input_days, g):
         return self.net(input_days, g)
@@ -218,19 +226,6 @@ class GraphNet(torch.nn.Module):
         return self.edge_weight
 
 
-class WrapperNet(torch.nn.Module):
-    def __init__(self, config):
-        super().__init__()
-
-        self.config = config
-        self.net = None
-
-    def forward(self, input_days, g):
-        ori_out = self.net(input_days, g)
-        out, state_gate, gov_gate = ori_out, torch.ones_like(ori_out), torch.ones_like(ori_out)
-        return out, state_gate, gov_gate
-
-
 if __name__ == '__main__':
     config = Config()
     parser = argparse.ArgumentParser(description='Batch Neural Network Experiments')
@@ -238,10 +233,5 @@ if __name__ == '__main__':
     node, graph = load_data.load_data()
     task = Task(config)
     task.set_random_seed()
-    net = GraphNet(task.config, task.edge_weight)
-
-
-
-
-
+    net = Wrapper(task.config, task.edge_weight)
 
