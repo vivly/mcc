@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 
 import model
-from base import BaseConfig
+from base import BaseConfig, BasePytorchTask, LOSS_KEY, BAR_KEY, SCALAR_LOG_KEY, VAL_SCORE_KEY
 from model import LSTM
 from torch_scatter import scatter
 
@@ -131,7 +131,6 @@ class Task:
         node_type_count = scatter(base_ones, self.node_type, dim_size=self.config.num_node_types, reduce='sum')
         self.node_weight = 1.0 / node_type_count * node_type_count.max()
 
-
     def train_LSTM(self):
         # This method is used for LSTM comparison
         train_data_ratio = 0.8  # Choose 80% of the data for training
@@ -217,8 +216,8 @@ class Wrapper(torch.nn.Module):
     def forward(self, input_days, g):
         if self.config.abl_type == 'mpnn_lstm':
             _x = input_days
-            edge_idx = g['edge_idx']
-            edge_wgt = g['edge_weight']
+            edge_idx = g['edge_index']
+            edge_wgt = g['edge_attr']
             out = self.net(_x, edge_idx, edge_wgt)
             return out
         else:
@@ -240,10 +239,6 @@ if __name__ == '__main__':
     task.set_random_seed()
     # Set random seed before the initialization of network parameters
     net = Wrapper(task.config)
-    task.init_model_and_optimizer(net)
     print('Building Neural Network...')
-    # Select epoch with the best validation accuracy
-    best_epoch = 50
-    if not task.config.infer:
-        task.fit()
+
 

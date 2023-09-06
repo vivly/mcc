@@ -119,7 +119,11 @@ def clean(jhu_dataset, gdp_dataset, policy_dataset):
     assert len(geo) == len(gdp) == len(confirm) == len(death) == len(population) == len(policy)
     # assertion: the length of dataframes ought to be the same
 
-    return dict(zip(node_rep_key, [geo, confirm, death, population, gdp, policy]))
+    length = [i for i in range(0, len(policy))]
+    county_indexer = dict(zip(policy.index, length))
+    county_indexer_inv = dict(zip(length, policy.index))
+
+    return dict(zip(node_rep_key, [geo, confirm, death, population, gdp, policy])), county_indexer, county_indexer_inv
 
 
 def calculate_geo_topology(node_rep, max_state_neighbour=5):
@@ -186,7 +190,7 @@ def calculate_geo_topology(node_rep, max_state_neighbour=5):
            rename(columns={'County_1': 'Node', 'County_2': 'Node_1'})
 
 
-def generate_us_graph(topo, node_rep, dump_fp, max_neighbor_num=50, dump_flag=True):
+def generate_us_graph(topo, node_rep, dump_fp, indexer, indexer_inv, max_neighbor_num=50, dump_flag=True):
     geo_df = node_rep['geo']
     geo_df['County'] = geo_df.apply(lambda x: '{} ~ {}'.format(x['Province_State'], x['Admin2']), axis=1)
     county_name_list = list(geo_df['County'])
@@ -198,12 +202,14 @@ def generate_us_graph(topo, node_rep, dump_fp, max_neighbor_num=50, dump_flag=Tr
 
     # graph defined by geographical information
     geo_index_src = list(topo['Node_1'].map(node2idx).values)
+    geo_indexer_src = [indexer[i] for i in geo_index_src]
     geo_index_tgt = list(topo['Node'].map(node2idx).values)
+    geo_indexer_tgt = [indexer[i] for i in geo_index_tgt]
     geo_weight = list(topo['distance'].map(lambda x: 1.0/np.sqrt(x)).values)
 
     # dump the graph into cpt file
     graph_info = {
-        'edge_index': torch.LongTensor([geo_index_src, geo_index_tgt]),
+        'edge_index': torch.LongTensor([geo_indexer_src, geo_indexer_tgt]),
         'edge_weight': torch.FloatTensor(geo_weight),
         'edge_type': torch.LongTensor(np.array([0]*len(geo_weight))),
         'node_name': county_name_list,
@@ -232,7 +238,7 @@ def load_data():
         OxCGRT_data = load_OxCGRT_policy_data(JHU_CSSE_data, fp_oxcgrt)
     # clean and align different datasets
 
-    node_rep_dict = clean(JHU_CSSE_data, gdp_data, OxCGRT_data)
+    node_rep_dict, idxer, idxer_inv = clean(JHU_CSSE_data, gdp_data, OxCGRT_data)
 
     if os.path.exists(fp_graph):
         graph_info = torch.load(fp_graph)
@@ -241,7 +247,8 @@ def load_data():
         # calculate the geology topo.
         geo_county = calculate_geo_topology(node_rep=node_rep_dict, max_state_neighbour=5)
         # generate the graph for all counties
-        graph_info = generate_us_graph(topo=geo_county, node_rep=node_rep_dict, dump_fp=fp_graph)
+        graph_info = generate_us_graph(topo=geo_county, node_rep=node_rep_dict, dump_fp=fp_graph, indexer=idxer,
+                                       indexer_inv=idxer_inv)
 
     return node_rep_dict, graph_info
 
