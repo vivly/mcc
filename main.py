@@ -5,10 +5,13 @@ import torch
 import numpy as np
 import pandas as pd
 
-import model
-from base import BaseConfig, BasePytorchTask, LOSS_KEY, BAR_KEY, SCALAR_LOG_KEY, VAL_SCORE_KEY
-from model import LSTM
+import models
+from base import BaseConfig
+from models import LSTM
 from torch_scatter import scatter
+from torch_geometric.loader import RandomNodeLoader
+from torch_geometric.data import Data
+from tqdm import tqdm
 
 
 class Config(BaseConfig):
@@ -19,23 +22,23 @@ class Config(BaseConfig):
         self.early_stop_epochs = 15
         self.infer = False
         self.cuda_device = torch.device('cuda:0')
-        self.batch_size = 3
+        self.batch_size = 1
 
         self.start_date = '2020-03-01'
         self.min_peak_size = -1
         self.forecast_date = '2021-02-14'
         self.lookback_days = 14
-        self.horizon = 3
+        self.horizon = 21
         self.val_days = 1
         self.sample_ratio = 0.8
         self.lookahead_days = 1
 
         # For MPNNLSTM
-        self.mpnnlstm_in_channels = 1
+        self.mpnnlstm_num_group = 10
         self.mpnnlstm_hidden_size = 16
-        self.mpnnlstm_num_nodes = 1000
-        self.mpnnlstm_window = 14
+        self.mpnnlstm_window = 1
         self.mpnnlstm_dropout = .01
+        self.mpnnlstm_in_channels = 1
 
         # For LSTM Abl
         self.abl_lstm_dim = 16
@@ -81,7 +84,7 @@ class Task:
         self.init_data()
         self.init_graph()
 
-        self.loss_func = torch.nn.MSELoss()
+        self.loss_func = torch.nn.L1Loss()
 
     def set_random_seed(self, seed=None):
         if seed is None:
@@ -102,22 +105,19 @@ class Task:
         print('Training division: ' + str(self.dates[train_div]) + ', Validation division: ' + str(self.dates[val_div])
               + ', Testing division: ' + self.dates[test_div])
 
-        self.train_day_inputs = self.day_inputs[:train_div+1]
-        self.train_day_outputs = self.day_outputs[:train_div+1]
-        self.train_dates = self.dates[:train_div+1]
+        self.train_day_inputs = self.day_inputs[:, train_div-self.config.lookback_days:train_div, :]
+        self.train_day_outputs = self.day_outputs[:, train_div+self.config.horizon, :]
+        self.config.train_day_seq_len = self.train_day_inputs.shape[1]
 
         if self.config.infer:
-            self.val_day_inputs = self.day_inputs[:train_div+1]
-            self.val_day_outputs = self.day_outputs[:train_div+1]
-            self.val_dates = self.dates[:train_div+1]
+            self.val_day_inputs = self.day_inputs[:, :train_div+1, :]
+            self.val_day_outputs = self.day_outputs[:, :train_div+1, :]
         else:
-            self.val_day_inputs = self.day_inputs[val_div: val_div+1]
-            self.val_day_outputs = self.day_outputs[val_div: val_div+1]
-            self.val_dates = self.dates[val_div: val_div+1]
+            self.val_day_inputs = self.day_inputs[:, val_div: val_div+1, :]
+            self.val_day_outputs = self.day_outputs[:, val_div: val_div+1, :]
 
-        self.test_day_inputs = self.day_inputs[test_div: test_div+1]
-        self.test_day_outputs = self.day_outputs[test_div: test_div + 1]
-        self.test_dates = self.dates[test_div: test_div+1]
+        self.test_day_inputs = self.day_inputs[:, test_div-self.config.lookback_days: test_div, :]
+        self.test_day_outputs = self.day_outputs[:, test_div+self.config.horizon, :]
 
     def init_graph(self):
         self.edge_index = graph['edge_index']
@@ -150,7 +150,7 @@ class Task:
         lstm_model = LSTM(input_size=1, hidden_size=self.config.abl_lstm_dim,
                           output_size=1, num_layers=self.config.abl_lstm_layer_num)
         lstm_model = lstm_model.to(device=self.config.cuda_device)
-        criterion = torch.nn.L1Loss()
+        criterion = torch.nn.MSELoss()
         optimizer = torch.optim.Adam(lstm_model.parameters(), lr=1e-2)
 
         prev_loss = 1000
@@ -200,16 +200,67 @@ class Task:
 
         exit(10)
 
+    def train_MPNN_LSTM(self):
+        self.net = models.MPNNLSTM(self.config)
+        edge_index = self.edge_index
+        edge_weight = self.edge_weight
+        train_x = torch.from_numpy(self.train_day_inputs[:, :, 0])
+        test_x = torch.from_numpy(self.test_day_inputs[:, :, 0])
+        train_y = torch.from_numpy(self.train_day_outputs.squeeze())
+        test_y = torch.from_numpy(self.test_day_outputs.squeeze())
+        g_train = Data(edge_index=edge_index, edge_attr=edge_weight, x=train_x, y=train_y)
+        g_test = Data(edge_index=edge_index, edge_attr=edge_weight, x=test_x, y=test_y)
+        train_loader = RandomNodeLoader(g_train, num_parts=self.config.mpnnlstm_num_group,
+                                         shuffle=True, drop_last=True)
+        test_loader = RandomNodeLoader(g_test, num_parts=self.config.mpnnlstm_num_group, shuffle=True, drop_last=True)
+        model = self.net.to(self.config.cuda_device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+        def train():
+            model.train()
+            mae_list = []
+            for data in train_loader:
+                data = data.to(self.config.cuda_device)
+                optimizer.zero_grad()
+                out = model(x=data.x, edge_idx=data.edge_index, edge_wgt=data.edge_attr)
+                criterion = self.loss_func
+                y_loss = criterion(out, data.y)
+                y_loss.backward()
+                optimizer.step()
+
+                mae = torch.abs(out - data.y).mean()
+                mae_list.append(mae.cpu().detach().numpy())
+            mae = np.mean(mae_list)
+            return mae
+
+        def test():
+            model.eval()
+            mae_list = []
+            for data in test_loader:
+                data = data.to(self.config.cuda_device)
+                out = model(x=data.x, edge_idx=data.edge_index, edge_wgt=data.edge_attr)
+
+                mae = torch.abs(out).mean()
+                mae_list.append(mae.cpu().detach().numpy())
+            mae = np.mean(mae_list)
+            return mae
+
+        for epoch in range(0, 1000):
+            loss = train()
+            accs = test()
+            print(f'Epoch: {epoch:02d}, Train: {loss:.4f}, Test_Outputs: {accs:.4f}')
+
 
 class Wrapper(torch.nn.Module):
     def __init__(self, conf):
         super().__init__()
         self.config = conf
 
-        if conf.abl_type == 'lstm':
+        if self.config.abl_type == 'lstm':
             task.train_LSTM()
-        elif conf.abl_type == 'mpnn_lstm':
-            self.net = model.MPNNLSTM(conf)
+        elif self.config.abl_type == 'mpnn_lstm':
+            task.train_MPNN_LSTM()
+
         else:
             raise ValueError('Unexpected Model Type')
 
@@ -239,6 +290,4 @@ if __name__ == '__main__':
     task.set_random_seed()
     # Set random seed before the initialization of network parameters
     net = Wrapper(task.config)
-    print('Building Neural Network...')
-
 
